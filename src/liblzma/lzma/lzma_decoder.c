@@ -639,12 +639,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 					assert(limit <= 5);
 					rep0 <<= limit;
 					assert(rep0 <= 96);
-					// -1 is fine, because we start
-					// decoding at model[1], not model[0].
-					// NOTE: This violates the C standard,
-					// since we are doing pointer
-					// arithmetic past the beginning of
-					// the array.
+
 					assert((int32_t)(rep0 - symbol - 1)
 							>= -1);
 					assert((int32_t)(rep0 - symbol - 1)
@@ -1030,12 +1025,7 @@ slow:
 					assert(limit <= 5);
 					rep0 <<= limit;
 					assert(rep0 <= 96);
-					// -1 is fine, because we start
-					// decoding at probs[1], not probs[0].
-					// NOTE: This violates the C standard,
-					// since we are doing pointer
-					// arithmetic past the beginning of
-					// the array.
+
 					assert((int32_t)(rep0 - symbol - 1)
 							>= -1);
 					assert((int32_t)(rep0 - symbol - 1)
