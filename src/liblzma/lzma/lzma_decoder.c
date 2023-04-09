@@ -27,6 +27,144 @@
 // direct bits. This may decode at maximum 20 bytes of input.
 #define LZMA_IN_REQUIRED 20
 
+//////////////////////////////
+// Probability Model macros //
+//////////////////////////////
+//
+// The Probability Models are combined into one contiguous array.
+// The macros are used to calculate the start offset for the separate
+// models contained in the array. Each sub-model consists of 2-3 macros:
+//
+// - The offset macro. This macro represents the number of probabilities
+//   between the base pointer to the beginning of the specific model. It
+//   is calculated using:
+//   previous offset macro + previous prob count macro.
+//
+// - The prob count macro. This represents the total number of
+//   probabilities needed by the sub-model. Some sub-models do not
+//   have this explicitly defined if the size is defined somewhere else.
+//
+// - The model macro. The arguments always include the base model pointer
+//   as the first argument. Optionally, the state or the position state are
+//   needed to find the correct sub-model.
+//
+// The macros that begin with "is_" are used to decode a single bit.
+// The other macros will decode multiple bits contiguously.
+//
+// These macros can be reused in an assembly version of the decoder
+// to simplify the implementation.
+
+// The start offset alters the pointer that is used for the base of the
+// model to optimize the most used probabilities to be closest to the
+// pointer. Currently the offset to is_rep_model() is the new offset 0.
+#define MODEL_START_OFFSET (POS_SPECIAL_PROB_COUNT \
+		+ IS_REP0_PROB_COUNT \
+		+ LEN_MODEL_PROB_COUNT * 2 \
+		+ IS_MATCH_MODEL_PROB_COUNT + ALIGN_SIZE)
+
+// The position special probability tree is used to decode the low bits
+// of the simple match distance when the match distance is in the range
+// [4, 127].
+#define POS_SPECIAL_OFFSET (-MODEL_START_OFFSET)
+#define POS_SPECIAL_PROB_COUNT (FULL_DISTANCES - DIST_MODEL_END)
+#define pos_special_model(model) (model + POS_SPECIAL_OFFSET)
+
+// The repeated match 0 long model decodes a single bit to determine if the
+// repeated match has a length of only 1 byte. If so, 1 byte is repeated
+// from the last distance used by a simple or repeated match. This does not
+// update the distance history cache.
+#define IS_REP0_LONG_OFFSET (POS_SPECIAL_OFFSET + POS_SPECIAL_PROB_COUNT)
+#define IS_REP0_PROB_COUNT (STATES << LZMA_PB_MAX)
+#define is_rep0_long_model(model, state, pos_state) (model \
+		+ IS_REP0_LONG_OFFSET + state + pos_state)
+
+// The repeated length model is used to decode the length (number
+// of bytes to repeat from the dictionary) of the repeated match.
+// The distance (how far back in the dictionary to start copying)
+// is determined through the is_repX models that are defined later
+// This size of this sub-model is defined later as LEN_MODEL_PROB_COUNT.
+#define REP_LENGTH_MODEL_OFFSET (IS_REP0_LONG_OFFSET + IS_REP0_PROB_COUNT)
+#define rep_length_model(model) (model + REP_LENGTH_MODEL_OFFSET)
+
+// The match length model is used to decode the length of a simple
+// match. Simple matches must also decode the distance. This size of
+// this sub-model is defined later as LEN_MODEL_PROB_COUNT.
+#define MATCH_LENGTH_OFFSET (REP_LENGTH_MODEL_OFFSET \
+		+ LEN_MODEL_PROB_COUNT)
+#define match_length_model(model) (model + MATCH_LENGTH_OFFSET)
+
+// The "is match" model determines if the next symbol is a literal or a match.
+#define IS_MATCH_MODEL_OFFSET (MATCH_LENGTH_OFFSET \
+		+ LEN_MODEL_PROB_COUNT)
+#define IS_MATCH_MODEL_PROB_COUNT (STATES << LZMA_PB_MAX)
+#define is_match_model(model, pos_state, state) (model \
+		+ IS_MATCH_MODEL_OFFSET + pos_state + state)
+
+// The position align probability tree is used to decode the lowest
+// four bits of the match distance when the distance is greater than 127.
+#define POS_ALIGN_OFFSET (IS_MATCH_MODEL_OFFSET + IS_MATCH_MODEL_PROB_COUNT)
+#define pos_align_model(model) ((model) + POS_ALIGN_OFFSET)
+
+// The "is rep" model decodes a single bit to determine if the match is a
+// simple match (0) or a repeated match (1).
+#define IS_REP_OFFSET (POS_ALIGN_OFFSET + ALIGN_SIZE)
+#define is_rep_model(model, state) (model + (IS_REP_OFFSET + state))
+
+// The "is rep 0" model decodes a single bit to determine if the repeated
+// match should use rep0 as the distance (0) or check the rep 1 model.
+#define IS_REP0_OFFSET (IS_REP_OFFSET + STATES)
+#define is_rep0_model(model, state) (model + (IS_REP0_OFFSET + state))
+
+// The "is rep 1" model decodes a single bit to determine if the repeated
+// match should use rep1 as the distance (0) or check the rep 2 model.
+#define IS_REP1_OFFSET (IS_REP0_OFFSET + STATES)
+#define is_rep1_model(model, state) (model + (IS_REP1_OFFSET + state))
+
+// The "is rep 2" model decodes a single bit to determine if the repeated
+// match should use rep2 as the distance (0) or rep3 (1).
+#define IS_REP2_OFFSET (IS_REP1_OFFSET + STATES)
+#define is_rep2_model(model, state) (model + (IS_REP2_OFFSET + state))
+
+// The distance slot probability tree is used to decode six bits, which
+// determine the highest two bits of the match distance and how to decode
+// the rest of the match distance.
+#define DIST_SLOT_OFFSET (IS_REP2_OFFSET + STATES)
+#define DIST_SLOT_PROB_COUNT (DIST_STATES << DIST_SLOT_BITS)
+#define dist_slot_model(model) (model + DIST_SLOT_OFFSET)
+
+// The literal model is used to decode 1 byte.
+#define LITERAL_OFFSET (DIST_SLOT_OFFSET + DIST_SLOT_PROB_COUNT)
+#define LITERAL_PROB_COUNT ((uint32_t) LITERAL_CODER_SIZE << LZMA_LCLP_MAX)
+#define literal_model(model) (model + LITERAL_OFFSET)
+
+// Select the literal sub-model from the base of the literal probability
+// tables. The table is selected by a context from lc number of high bits
+// from the previous literal combined with lp number of low bits from the
+// current location in the output stream. The context must be multiplied
+// by 0x300 to select the correct sub-table. The formula below is optimized
+// to only need to multiply by 3 because of the way the literal position
+// mask was created in lzma_decoder_reset().
+#define literal_subdecoder(model, dict, lp_mask, lc) model \
+		+ (uint32_t) 3 * ((((dict.pos << 8) + dict_get(&dict, 0)) \
+		& lp_mask) << lc);
+
+// The total number of probability values needed for the entire model.
+#define PROBABILITY_COUNT (LITERAL_OFFSET \
+		+ LITERAL_PROB_COUNT \
+		+ MODEL_START_OFFSET)
+
+// The match length macros are relative to the beginning of the models.
+// LZMA uses two different match length models:
+// - Simple match length
+// - Repeated match length
+#define LEN_MODEL_CHOICE_OFFSET 0
+#define LEN_MODEL_CHOICE_2_OFFSET (LEN_MODEL_CHOICE_OFFSET + LEN_LOW_SYMBOLS)
+
+#define LEN_MODEL_HIGH_OFFSET (LEN_MODEL_CHOICE_OFFSET \
+		+ ((1 << LZMA_PB_MAX) << LEN_LOW_BITS) \
+		+ ((1 << LZMA_PB_MAX) << LEN_MID_BITS))
+
+#define LEN_MODEL_PROB_COUNT (LEN_MODEL_HIGH_OFFSET + LEN_HIGH_SYMBOLS)
 
 // Macros for (somewhat) size-optimized code.
 // This is used to decode the match length (how many bytes must be repeated
@@ -103,63 +241,12 @@ do { \
 } while (0)
 
 
-/// Length decoder probabilities; see comments in lzma_common.h.
-typedef struct {
-	probability choice;
-	probability choice2;
-	probability low[POS_STATES_MAX][LEN_LOW_SYMBOLS];
-	probability mid[POS_STATES_MAX][LEN_MID_SYMBOLS];
-	probability high[LEN_HIGH_SYMBOLS];
-} lzma_length_decoder;
-
-
 typedef struct {
 	///////////////////
 	// Probabilities //
 	///////////////////
 
-	/// Literals; see comments in lzma_common.h.
-	probability literal[LITERAL_CODERS_MAX][LITERAL_CODER_SIZE];
-
-	/// If 1, it's a match. Otherwise it's a single 8-bit literal.
-	probability is_match[STATES][POS_STATES_MAX];
-
-	/// If 1, it's a repeated match. The distance is one of rep0 .. rep3.
-	probability is_rep[STATES];
-
-	/// If 0, distance of a repeated match is rep0.
-	/// Otherwise check is_rep1.
-	probability is_rep0[STATES];
-
-	/// If 0, distance of a repeated match is rep1.
-	/// Otherwise check is_rep2.
-	probability is_rep1[STATES];
-
-	/// If 0, distance of a repeated match is rep2. Otherwise it is rep3.
-	probability is_rep2[STATES];
-
-	/// If 1, the repeated match has length of one byte. Otherwise
-	/// the length is decoded from rep_len_decoder.
-	probability is_rep0_long[STATES][POS_STATES_MAX];
-
-	/// Probability tree for the highest two bits of the match distance.
-	/// There is a separate probability tree for match lengths of
-	/// 2 (i.e. MATCH_LEN_MIN), 3, 4, and [5, 273].
-	probability dist_slot[DIST_STATES][DIST_SLOTS];
-
-	/// Probability trees for additional bits for match distance when the
-	/// distance is in the range [4, 127].
-	probability pos_special[FULL_DISTANCES - DIST_MODEL_END];
-
-	/// Probability tree for the lowest four bits of a match distance
-	/// that is equal to or greater than 128.
-	probability pos_align[ALIGN_SIZE];
-
-	/// Length of a normal match
-	lzma_length_decoder match_len_decoder;
-
-	/// Length of a repeated match
-	lzma_length_decoder rep_len_decoder;
+	probability model[PROBABILITY_COUNT];
 
 	///////////////////
 	// Decoder state //
@@ -1149,11 +1236,9 @@ lzma_decoder_reset(void *coder_ptr, const void *opt)
 	// Calculate pos_mask. We don't need pos_bits as is for anything.
 	coder->pos_mask = (1U << options->pb) - 1;
 
-	// Initialize the literal decoder.
-	literal_init(coder->literal, options->lc, options->lp);
-
 	coder->literal_context_bits = options->lc;
-	coder->literal_pos_mask = (1U << options->lp) - 1;
+	coder->literal_pos_mask = ((uint32_t) 0x100 << options->lp)
+			- ((uint32_t) 0x100 >> options->lc);
 
 	// State
 	coder->state = STATE_LIT_LIT;
@@ -1166,48 +1251,9 @@ lzma_decoder_reset(void *coder_ptr, const void *opt)
 	// Range decoder
 	rc_reset(coder->rc);
 
-	// Bit and bittree decoders
-	for (uint32_t i = 0; i < STATES; ++i) {
-		for (uint32_t j = 0; j <= coder->pos_mask; ++j) {
-			bit_reset(coder->is_match[i][j]);
-			bit_reset(coder->is_rep0_long[i][j]);
-		}
-
-		bit_reset(coder->is_rep[i]);
-		bit_reset(coder->is_rep0[i]);
-		bit_reset(coder->is_rep1[i]);
-		bit_reset(coder->is_rep2[i]);
-	}
-
-	for (uint32_t i = 0; i < DIST_STATES; ++i)
-		bittree_reset(coder->dist_slot[i], DIST_SLOT_BITS);
-
-	for (uint32_t i = 0; i < FULL_DISTANCES - DIST_MODEL_END; ++i)
-		bit_reset(coder->pos_special[i]);
-
-	bittree_reset(coder->pos_align, ALIGN_BITS);
-
-	// Len decoders (also bit/bittree)
-	const uint32_t num_pos_states = 1U << options->pb;
-	bit_reset(coder->match_len_decoder.choice);
-	bit_reset(coder->match_len_decoder.choice2);
-	bit_reset(coder->rep_len_decoder.choice);
-	bit_reset(coder->rep_len_decoder.choice2);
-
-	for (uint32_t pos_state = 0; pos_state < num_pos_states; ++pos_state) {
-		bittree_reset(coder->match_len_decoder.low[pos_state],
-				LEN_LOW_BITS);
-		bittree_reset(coder->match_len_decoder.mid[pos_state],
-				LEN_MID_BITS);
-
-		bittree_reset(coder->rep_len_decoder.low[pos_state],
-				LEN_LOW_BITS);
-		bittree_reset(coder->rep_len_decoder.mid[pos_state],
-				LEN_MID_BITS);
-	}
-
-	bittree_reset(coder->match_len_decoder.high, LEN_HIGH_BITS);
-	bittree_reset(coder->rep_len_decoder.high, LEN_HIGH_BITS);
+	// Init probabilities
+	for (uint32_t i = 0; i < PROBABILITY_COUNT; i++)
+		bit_reset(coder->model[i]);
 
 	coder->sequence = SEQ_IS_MATCH;
 	coder->probs = NULL;
