@@ -170,25 +170,26 @@
 // This is used to decode the match length (how many bytes must be repeated
 // from the dictionary). This version is used in the Resumable mode and
 // does not unroll any loops.
-#define len_decode(target, ld, pos_state, seq) \
+#define len_decode(target, sub_tree, prob_tree, pos_state, seq) \
 do { \
 case seq ## _CHOICE: \
-	rc_if_0_safe(ld.choice, seq ## _CHOICE) { \
-		rc_update_0(ld.choice); \
-		probs = ld.low[pos_state];\
+	rc_if_0_safe(sub_tree, seq ## _CHOICE) { \
+		rc_update_0(sub_tree); \
+		sub_tree += pos_state; \
 		limit = LEN_LOW_SYMBOLS; \
 		target = MATCH_LEN_MIN; \
 	} else { \
-		rc_update_1(ld.choice); \
+		rc_update_1(sub_tree); \
+		sub_tree += LEN_MODEL_CHOICE_2_OFFSET; \
 case seq ## _CHOICE2: \
-		rc_if_0_safe(ld.choice2, seq ## _CHOICE2) { \
-			rc_update_0(ld.choice2); \
-			probs = ld.mid[pos_state]; \
+		rc_if_0_safe(sub_tree, seq ## _CHOICE2) { \
+			rc_update_0(sub_tree); \
+			sub_tree += pos_state; \
 			limit = LEN_MID_SYMBOLS; \
 			target = MATCH_LEN_MIN + LEN_LOW_SYMBOLS; \
 		} else { \
-			rc_update_1(ld.choice2); \
-			probs = ld.high; \
+			rc_update_1(sub_tree); \
+			sub_tree = prob_tree + LEN_MODEL_HIGH_OFFSET; \
 			limit = LEN_HIGH_SYMBOLS; \
 			target = MATCH_LEN_MIN + LEN_LOW_SYMBOLS \
 					+ LEN_MID_SYMBOLS; \
@@ -197,7 +198,7 @@ case seq ## _CHOICE2: \
 	symbol = 1; \
 case seq ## _BITTREE: \
 	do { \
-		rc_bit_safe(probs[symbol], , , seq ## _BITTREE); \
+		rc_bit_safe(sub_tree + symbol, , , seq ## _BITTREE); \
 	} while (symbol < limit); \
 	target += symbol - limit; \
 } while (0)
@@ -205,34 +206,39 @@ case seq ## _BITTREE: \
 
 // This is the faster version of the match length decoder that does not
 // worry about being resumable. It unrolls the bittree decoding loop.
-#define len_decode_fast(target, ld, pos_state) \
+#define len_decode_fast(target, prob_tree, pos_state) \
 do { \
 	symbol = 1; \
-	rc_if_0(ld.choice) { \
-		rc_update_0(ld.choice); \
-		rc_bit(ld.low[pos_state][symbol], , ); \
-		rc_bit(ld.low[pos_state][symbol], , ); \
-		rc_bit(ld.low[pos_state][symbol], , ); \
+	probability *sub_tree = prob_tree; \
+	rc_if_0(sub_tree) { \
+		rc_update_0(sub_tree); \
+		sub_tree += pos_state; \
+		rc_bit(sub_tree + symbol, , ); \
+		rc_bit(sub_tree + symbol, , ); \
+		rc_bit(sub_tree + symbol, , ); \
 		target = symbol - LEN_LOW_SYMBOLS + MATCH_LEN_MIN; \
 	} else { \
-		rc_update_1(ld.choice); \
-		rc_if_0(ld.choice2) { \
-			rc_update_0(ld.choice2); \
-			rc_bit(ld.mid[pos_state][symbol], , ); \
-			rc_bit(ld.mid[pos_state][symbol], , ); \
-			rc_bit(ld.mid[pos_state][symbol], , ); \
+		rc_update_1(sub_tree); \
+		sub_tree += LEN_MODEL_CHOICE_2_OFFSET; \
+		rc_if_0(sub_tree) { \
+			rc_update_0(sub_tree); \
+			sub_tree += pos_state; \
+			rc_bit(sub_tree + symbol, , ); \
+			rc_bit(sub_tree + symbol, , ); \
+			rc_bit(sub_tree + symbol, , ); \
 			target = symbol - LEN_MID_SYMBOLS \
 					+ MATCH_LEN_MIN + LEN_LOW_SYMBOLS; \
 		} else { \
-			rc_update_1(ld.choice2); \
-			rc_bit(ld.high[symbol], , ); \
-			rc_bit(ld.high[symbol], , ); \
-			rc_bit(ld.high[symbol], , ); \
-			rc_bit(ld.high[symbol], , ); \
-			rc_bit(ld.high[symbol], , ); \
-			rc_bit(ld.high[symbol], , ); \
-			rc_bit(ld.high[symbol], , ); \
-			rc_bit(ld.high[symbol], , ); \
+			rc_update_1(sub_tree); \
+			sub_tree = prob_tree + LEN_MODEL_HIGH_OFFSET; \
+			rc_bit(sub_tree + symbol, , ); \
+			rc_bit(sub_tree + symbol, , ); \
+			rc_bit(sub_tree + symbol, , ); \
+			rc_bit(sub_tree + symbol, , ); \
+			rc_bit(sub_tree + symbol, , ); \
+			rc_bit(sub_tree + symbol, , ); \
+			rc_bit(sub_tree + symbol, , ); \
+			rc_bit(sub_tree + symbol, , ); \
 			target = symbol - LEN_HIGH_SYMBOLS \
 					+ MATCH_LEN_MIN \
 					+ LEN_LOW_SYMBOLS + LEN_MID_SYMBOLS; \
@@ -381,7 +387,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 	const uint32_t literal_context_bits = coder->literal_context_bits;
 
 	// Temporary variables
-	uint32_t pos_state = dict.pos & pos_mask;
+	uint32_t pos_state = (dict.pos & pos_mask) << LZMA_PB_MAX;
 
 	lzma_ret ret = LZMA_OK;
 
@@ -440,12 +446,14 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 	//     coder->sequence where to resume in the decoder loop. This
 	//     is the only mode used when HAVE_SMALL is defined.
 
+	probability *model_base = coder->model + MODEL_START_OFFSET;
+
 	switch (coder->sequence)
 	while (true) {
 		// Calculate new pos_state. This is skipped on the first loop
 		// since we already calculated it when setting up the local
 		// variables.
-		pos_state = dict.pos & pos_mask;
+		pos_state = (dict.pos & pos_mask) << LZMA_PB_MAX;
 
 #ifndef HAVE_SMALL
 
@@ -463,19 +471,21 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 		// If the bit is a 0, then we handle it as a literal.
 		// If the bit is a 1, then it is a match of previously
 		// decoded data.
-		rc_if_0(coder->is_match[state][pos_state]) {
+		probability *model = is_match_model(model_base, pos_state,
+				state);
+		rc_if_0(model) {
 			/////////////////////
 			// Decode literal. //
 			/////////////////////
 
 			// Update the RC that we have decoded a 0.
-			rc_update_0(coder->is_match[state][pos_state]);
+			rc_update_0(model);
 
-			// Get the correct probability array from lp and
-			// lc params.
-			probs = literal_subcoder(coder->literal,
-					literal_context_bits, literal_pos_mask,
-					dict.pos, dict_get(&dict, 0));
+			// Get the correct probability table from
+			// lp and lc params.
+			model = literal_subdecoder(literal_model(model_base),
+					dict, literal_pos_mask,
+					literal_context_bits);
 			symbol = 1;
 
 			if (is_literal_state(state)) {
@@ -483,14 +493,14 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 				// We need to decode 8 bits, so instead
 				// of looping from 1 - 8, we unroll the
 				// loop for a speed optimization.
-				rc_bit(probs[symbol], , );
-				rc_bit(probs[symbol], , );
-				rc_bit(probs[symbol], , );
-				rc_bit(probs[symbol], , );
-				rc_bit(probs[symbol], , );
-				rc_bit(probs[symbol], , );
-				rc_bit(probs[symbol], , );
-				rc_bit(probs[symbol], , );
+				rc_bit(model + symbol, , );
+				rc_bit(model + symbol, , );
+				rc_bit(model + symbol, , );
+				rc_bit(model + symbol, , );
+				rc_bit(model + symbol, , );
+				rc_bit(model + symbol, , );
+				rc_bit(model + symbol, , );
+				rc_bit(model + symbol, , );
 			} else {
 				// Decode literal with match byte.
 				//
@@ -514,7 +524,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 #	define decode_with_match_bit \
 			match_bit = len & offset; \
 			subcoder_index = offset + match_bit + symbol; \
-			rc_bit(probs[subcoder_index], \
+			rc_bit(model + subcoder_index, \
 					offset &= ~match_bit, \
 					offset &= match_bit)
 
@@ -553,9 +563,10 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 		// back in the dictionary to begin copying. The length
 		// represents how many bytes to copy.
 
-		rc_update_1(coder->is_match[state][pos_state]);
+		rc_update_1(model);
 
-		rc_if_0(coder->is_rep[state]) {
+		model = is_rep_model(model_base, state);
+		rc_if_0(model) {
 			///////////////////
 			// Simple match. //
 			///////////////////
@@ -570,7 +581,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 			// then we know to stop decoding (end of payload
 			// marker).
 
-			rc_update_0(coder->is_rep[state]);
+			rc_update_0(model);
 			update_match(state);
 
 			// The latest three match distances are kept in
@@ -580,22 +591,23 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 			rep1 = rep0;
 
 			// Decode the length of the match.
-			len_decode_fast(len, coder->match_len_decoder,
+			len_decode_fast(len, match_length_model(model_base),
 					pos_state);
 
 			// Next, decode the distance into rep0.
 
 			// The next 6 bits determine how to decode the
 			// rest of the distance.
-			probs = coder->dist_slot[get_dist_state(len)];
+			model = dist_slot_model(model_base)
+				+ (get_dist_state(len) << DIST_SLOT_BITS);
 			symbol = 1;
 
-			rc_bit(probs[symbol], , );
-			rc_bit(probs[symbol], , );
-			rc_bit(probs[symbol], , );
-			rc_bit(probs[symbol], , );
-			rc_bit(probs[symbol], , );
-			rc_bit(probs[symbol], , );
+			rc_bit(model + symbol, , );
+			rc_bit(model + symbol, , );
+			rc_bit(model + symbol, , );
+			rc_bit(model + symbol, , );
+			rc_bit(model + symbol, , );
+			rc_bit(model + symbol, , );
 
 			// Get rid of the highest bit that was needed for
 			// indexing of the probability array.
@@ -628,7 +640,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 					rep0 <<= limit;
 					assert(rep0 <= 96);
 					// -1 is fine, because we start
-					// decoding at probs[1], not probs[0].
+					// decoding at model[1], not model[0].
 					// NOTE: This violates the C standard,
 					// since we are doing pointer
 					// arithmetic past the beginning of
@@ -637,7 +649,9 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 							>= -1);
 					assert((int32_t)(rep0 - symbol - 1)
 							<= 82);
-					probs = coder->pos_special + rep0
+
+					model = pos_special_model(model_base)
+							+ rep0
 							- symbol - 1;
 					symbol = 1;
 					offset = 0;
@@ -645,22 +659,22 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 					switch (limit) {
 					case 5:
 						assert(offset == 0);
-						rc_bit(probs[symbol], ,
+						rc_bit(model + symbol, ,
 							rep0 += 1U);
 						++offset;
 						--limit;
 					case 4:
-						rc_bit(probs[symbol], ,
+						rc_bit(model + symbol, ,
 							rep0 += 1U << offset);
 						++offset;
 						--limit;
 					case 3:
-						rc_bit(probs[symbol], ,
+						rc_bit(model + symbol, ,
 							rep0 += 1U << offset);
 						++offset;
 						--limit;
 					case 2:
-						rc_bit(probs[symbol], ,
+						rc_bit(model + symbol, ,
 							rep0 += 1U << offset);
 						++offset;
 						--limit;
@@ -671,7 +685,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 						// rc_bit_last() here to
 						// omit the unneeded updating
 						// of "symbol".
-						rc_bit_last(probs[symbol], ,
+						rc_bit_last(model + symbol, ,
 							rep0 += 1U << offset);
 					}
 				} else {
@@ -692,14 +706,16 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 					// probabilities.
 					rep0 <<= ALIGN_BITS;
 					symbol = 1;
+					model = pos_align_model(model_base);
 
-					rc_bit(coder->pos_align[symbol], ,
+
+					rc_bit(model + symbol, ,
 							rep0 += 1);
 
-					rc_bit(coder->pos_align[symbol], ,
+					rc_bit(model + symbol, ,
 							rep0 += 2);
 
-					rc_bit(coder->pos_align[symbol], ,
+					rc_bit(model + symbol, ,
 							rep0 += 4);
 
 					// Like when distance [4, 127], we
@@ -707,7 +723,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 					// other than indexing the probability
 					// array.
 					rc_bit_last(
-						coder->pos_align[symbol], ,
+						model + symbol, ,
 						rep0 += 8);
 
 					if (rep0 == UINT32_MAX) {
@@ -750,7 +766,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 			}
 
 		} else {
-			rc_update_1(coder->is_rep[state]);
+			rc_update_1(model);
 			/////////////////////
 			// Repeated match. //
 			/////////////////////
@@ -767,8 +783,9 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 				goto out;
 			}
 
-			rc_if_0(coder->is_rep0[state]) {
-				rc_update_0(coder->is_rep0[state]);
+			model = is_rep0_model(model_base, state);
+			rc_if_0(model) {
+				rc_update_0(model);
 				// The distance is rep0.
 
 				// Decode the next bit to determine if 1 byte
@@ -779,9 +796,11 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 				// "Short Rep Match" and only 1 bit is copied.
 				// Otherwise, the length of the match is
 				// decoded after the "else" statement.
-				rc_if_0(coder->is_rep0_long[state][pos_state]) {
-					rc_update_0(coder->is_rep0_long[
-							state][pos_state]);
+				model = is_rep0_long_model(model_base, state,
+						pos_state);
+
+				rc_if_0(model) {
+					rc_update_0(model);
 
 					update_short_rep(state);
 					dict_put(&dict, dict_get(&dict, rep0));
@@ -790,11 +809,10 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 
 				// Repeating more than one byte at
 				// distance of rep0.
-				rc_update_1(coder->is_rep0_long[
-						state][pos_state]);
+				rc_update_1(model);
 
 			} else {
-				rc_update_1(coder->is_rep0[state]);
+				rc_update_1(model);
 
 				// The distance is rep1, rep2 or rep3. Once
 				// we find out which one of these three, it
@@ -802,21 +820,22 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 				// are updated accordingly. There is no
 				// "Short Rep Match" option, so the length
 				// of the match must always be decoded next.
-				rc_if_0(coder->is_rep1[state]) {
+				model = is_rep1_model(model_base, state);
+				rc_if_0(model) {
 					// The distance is rep1.
-					rc_update_0(coder->is_rep1[state]);
+					rc_update_0(model);
 
 					const uint32_t distance = rep1;
 					rep1 = rep0;
 					rep0 = distance;
 
 				} else {
-					rc_update_1(coder->is_rep1[state]);
+					rc_update_1(model);
 
-					rc_if_0(coder->is_rep2[state]) {
+					model = is_rep2_model(model_base, state);
+					rc_if_0(model) {
 						// The distance is rep2.
-						rc_update_0(coder->is_rep2[
-								state]);
+						rc_update_0(model);
 
 						const uint32_t distance = rep2;
 						rep2 = rep1;
@@ -825,8 +844,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 
 					} else {
 						// The distance is rep3.
-						rc_update_1(coder->is_rep2[
-								state]);
+						rc_update_1(model);
 
 						const uint32_t distance = rep3;
 						rep3 = rep2;
@@ -840,8 +858,7 @@ lzma_decode(void *coder_ptr, lzma_dict *restrict dictptr,
 			update_long_rep(state);
 
 			// Decode the length of the repeated match.
-			len_decode_fast(len, coder->rep_len_decoder,
-					pos_state);
+			len_decode_fast(len, rep_length_model(model_base), pos_state);
 		}
 
 		/////////////////////////////////
@@ -901,16 +918,19 @@ slow:
 			eopm_is_valid = true;
 		}
 
-		rc_if_0_safe(coder->is_match[state][pos_state], SEQ_IS_MATCH) {
+		probs = is_match_model(model_base, pos_state, state);
+
+		rc_if_0_safe(probs, SEQ_IS_MATCH) {
 			/////////////////////
 			// Decode literal. //
 			/////////////////////
 
-			rc_update_0(coder->is_match[state][pos_state]);
+			rc_update_0(probs);
 
-			probs = literal_subcoder(coder->literal,
-					literal_context_bits, literal_pos_mask,
-					dict.pos, dict_get(&dict, 0));
+			probs = literal_subdecoder(literal_model(model_base),
+					dict, literal_pos_mask,
+					literal_context_bits);
+
 			symbol = 1;
 
 			if (is_literal_state(state)) {
@@ -919,7 +939,7 @@ slow:
 				// the loop.
 	case SEQ_LITERAL:
 				do {
-					rc_bit_safe(probs[symbol], , ,
+					rc_bit_safe(probs + symbol, , ,
 							SEQ_LITERAL);
 				} while (symbol < (1 << 8));
 			} else {
@@ -936,7 +956,7 @@ slow:
 							= offset + match_bit
 							+ symbol;
 
-					rc_bit_safe(probs[subcoder_index],
+					rc_bit_safe(probs + subcoder_index,
 							offset &= ~match_bit,
 							offset &= match_bit,
 							SEQ_LITERAL_MATCHED);
@@ -966,30 +986,34 @@ slow:
 		// Decode match. //
 		///////////////////
 
-		rc_update_1(coder->is_match[state][pos_state]);
+		rc_update_1(probs);
+		probs = is_rep_model(model_base, state);
 
 	case SEQ_IS_REP:
-		rc_if_0_safe(coder->is_rep[state], SEQ_IS_REP) {
+		rc_if_0_safe(probs, SEQ_IS_REP) {
 			///////////////////
 			// Simple match. //
 			///////////////////
 
-			rc_update_0(coder->is_rep[state]);
+			rc_update_0(probs);
 			update_match(state);
 
 			rep3 = rep2;
 			rep2 = rep1;
 			rep1 = rep0;
 
-			len_decode(len, coder->match_len_decoder,
+			probs = match_length_model(model_base);
+
+			len_decode(len, probs, match_length_model(model_base),
 					pos_state, SEQ_MATCH_LEN);
 
-			probs = coder->dist_slot[get_dist_state(len)];
+			probs = dist_slot_model(model_base)
+				+ (get_dist_state(len) << DIST_SLOT_BITS);
 			symbol = 1;
 
 	case SEQ_DIST_SLOT:
 			do {
-				rc_bit_safe(probs[symbol], , , SEQ_DIST_SLOT);
+				rc_bit_safe(probs + symbol, , , SEQ_DIST_SLOT);
 			} while (symbol < DIST_SLOTS);
 
 			symbol -= DIST_SLOTS;
@@ -1016,13 +1040,14 @@ slow:
 							>= -1);
 					assert((int32_t)(rep0 - symbol - 1)
 							<= 82);
-					probs = coder->pos_special + rep0
+
+					probs = pos_special_model(model_base) + rep0
 							- symbol - 1;
 					symbol = 1;
 					offset = 0;
 	case SEQ_DIST_MODEL:
 					do {
-						rc_bit_safe(probs[symbol], ,
+						rc_bit_safe(probs + symbol, ,
 							rep0 += 1U << offset,
 							SEQ_DIST_MODEL);
 					} while (++offset < limit);
@@ -1041,10 +1066,10 @@ slow:
 					symbol = 1;
 
 					offset = 0;
+					probs = pos_align_model(model_base);
 	case SEQ_ALIGN:
 					do {
-						rc_bit_safe(coder->pos_align[
-								symbol], ,
+						rc_bit_safe(probs + symbol, ,
 							rep0 += 1U << offset,
 							SEQ_ALIGN);
 					} while (++offset < ALIGN_BITS);
@@ -1076,24 +1101,21 @@ slow:
 			// Repeated match. //
 			/////////////////////
 
-			rc_update_1(coder->is_rep[state]);
+			rc_update_1(probs);
 
 			if (unlikely(!dict_is_distance_valid(&dict, 0))) {
 				ret = LZMA_DATA_ERROR;
 				goto out;
 			}
 
+			probs = is_rep0_model(model_base, state);
 	case SEQ_IS_REP0:
-			rc_if_0_safe(coder->is_rep0[state], SEQ_IS_REP0) {
-				rc_update_0(coder->is_rep0[state]);
-
+			rc_if_0_safe(probs, SEQ_IS_REP0) {
+				rc_update_0(probs);
+				probs = is_rep0_long_model(model_base, state, pos_state);
 	case SEQ_IS_REP0_LONG:
-				rc_if_0_safe(coder->is_rep0_long
-						[state][pos_state],
-						SEQ_IS_REP0_LONG) {
-					rc_update_0(coder->is_rep0_long[
-							state][pos_state]);
-
+				rc_if_0_safe(probs, SEQ_IS_REP0_LONG) {
+					rc_update_0(probs);
 					update_short_rep(state);
 
 	case SEQ_SHORTREP:
@@ -1107,27 +1129,25 @@ slow:
 					continue;
 				}
 
-				rc_update_1(coder->is_rep0_long[
-						state][pos_state]);
+				rc_update_1(probs);
 
 			} else {
-				rc_update_1(coder->is_rep0[state]);
-
+				rc_update_1(probs);
+				probs = is_rep1_model(model_base, state);
 	case SEQ_IS_REP1:
-				rc_if_0_safe(coder->is_rep1[state], SEQ_IS_REP1) {
-					rc_update_0(coder->is_rep1[state]);
+				rc_if_0_safe(probs, SEQ_IS_REP1) {
+					rc_update_0(probs);
 
 					const uint32_t distance = rep1;
 					rep1 = rep0;
 					rep0 = distance;
 
 				} else {
-					rc_update_1(coder->is_rep1[state]);
+					rc_update_1(probs);
+					probs = is_rep2_model(model_base, state);
 	case SEQ_IS_REP2:
-					rc_if_0_safe(coder->is_rep2[state],
-							SEQ_IS_REP2) {
-						rc_update_0(coder->is_rep2[
-								state]);
+					rc_if_0_safe(probs, SEQ_IS_REP2) {
+						rc_update_0(probs);
 
 						const uint32_t distance = rep2;
 						rep2 = rep1;
@@ -1135,8 +1155,7 @@ slow:
 						rep0 = distance;
 
 					} else {
-						rc_update_1(coder->is_rep2[
-								state]);
+						rc_update_1(probs);
 
 						const uint32_t distance = rep3;
 						rep3 = rep2;
@@ -1149,8 +1168,9 @@ slow:
 
 			update_long_rep(state);
 
-			len_decode(len, coder->rep_len_decoder,
-					pos_state, SEQ_REP_LEN);
+			probs = rep_length_model(model_base);
+			len_decode(len, probs, rep_length_model(model_base), pos_state, SEQ_REP_LEN);
+
 		}
 
 		/////////////////////////////////
