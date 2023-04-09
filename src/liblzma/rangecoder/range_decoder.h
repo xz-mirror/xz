@@ -122,13 +122,13 @@ do { \
 ///
 #define rc_if_0(prob) \
 	rc_normalize(); \
-	rc_bound = (rc.range >> RC_BIT_MODEL_TOTAL_BITS) * (prob); \
+	rc_bound = (rc.range >> RC_BIT_MODEL_TOTAL_BITS) * *(prob); \
 	if (rc.code < rc_bound)
 
 
 #define rc_if_0_safe(prob, seq) \
 	rc_normalize_safe(seq); \
-	rc_bound = (rc.range >> RC_BIT_MODEL_TOTAL_BITS) * (prob); \
+	rc_bound = (rc.range >> RC_BIT_MODEL_TOTAL_BITS) * *(prob); \
 	if (rc.code < rc_bound)
 
 
@@ -137,7 +137,7 @@ do { \
 #define rc_update_0(prob) \
 do { \
 	rc.range = rc_bound; \
-	prob += (RC_BIT_MODEL_TOTAL - (prob)) >> RC_MOVE_BITS; \
+	*(prob) += (RC_BIT_MODEL_TOTAL - *(prob)) >> RC_MOVE_BITS; \
 } while (0)
 
 
@@ -147,7 +147,7 @@ do { \
 do { \
 	rc.range -= rc_bound; \
 	rc.code -= rc_bound; \
-	prob -= (prob) >> RC_MOVE_BITS; \
+	*(prob) -= *(prob) >> RC_MOVE_BITS; \
 } while (0)
 
 
